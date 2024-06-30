@@ -1,0 +1,215 @@
+import geopandas as gpd
+import numpy as np
+import rasterio
+import os
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score, roc_curve, precision_score, recall_score, f1_score, accuracy_score
+import matplotlib.pyplot as plt
+from shapely.geometry import Point
+from joblib import Parallel, delayed
+import pandas as pd
+
+# Function to extract values from a raster for a set of points
+def extract_values_parallel(points, raster_path):
+    with rasterio.open(raster_path) as src:
+        raster_data = src.read(1)  # 读取整个波段
+        transform = src.transform
+        # 从GeoSeries中的Point几何体提取坐标
+        x = np.array([geom.x for geom in points['geometry']])
+        y = np.array([geom.y for geom in points['geometry']])
+        col, row = ~transform * (x, y)
+        return raster_data[row.astype(int), col.astype(int)]
+
+# Function to extract values for all environmental layers in parallel
+def extract_all_values(points, environmental_layers):
+    results = Parallel(n_jobs=-1)(delayed(extract_values_parallel)(points, layer) for layer in environmental_layers)
+    return np.array(results).T
+
+# Import species point data from a shapefile
+species_shp = gpd.read_file(r'E:\Primula.L\disitrbution\five\Primula_secundiflora\se_sdm_spatially_rarified_locs.shp')
+
+# Function to generate background points around the species points with a buffer
+def generate_background_points(species, seed=None, buffer_distance=5000):
+    bounding_box = species.total_bounds
+    np.random.seed(seed)
+    minx, miny, maxx, maxy = bounding_box
+    species_mercator = species.to_crs(epsg=3857)
+    points = []
+    for _ in range(len(species)):
+        valid = False
+        while not valid:
+            x = np.random.uniform(minx, maxx)
+            y = np.random.uniform(miny, maxy)
+            point = Point(x, y)
+            point_mercator = gpd.GeoSeries([point], crs=species.crs).to_crs(epsg=3857)[0]
+            min_distance = species_mercator.distance(point_mercator).min()
+            if min_distance >= buffer_distance:
+                points.append(point)
+                valid = True
+    return gpd.GeoDataFrame({'geometry': points}, crs=species.crs)
+
+# Generate background points
+background_points = generate_background_points(species_shp, seed=42, buffer_distance=5000)
+
+# Get all .tif files from the directory
+directory = r'D:\Primula.L\Primula.L\clim\xinan_bio_clim\ssp126_2021_2040'
+environmental_layers = [os.path.join(directory, file) for file in os.listdir(directory) if file.endswith('.tif')]
+
+# Extract values for all points and all environmental layers
+all_data = extract_all_values(pd.concat([species_shp, background_points]), environmental_layers)
+
+# Convert the extracted data into a matrix format
+data_matrix = all_data
+
+# Remove rows with NaN values
+data_matrix = data_matrix[~np.isnan(data_matrix).any(axis=1)]
+
+# Create labels for species and background points
+labels = np.concatenate([np.ones(len(species_shp)), np.zeros(len(background_points))])
+
+# Split the dataset into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(data_matrix, labels, test_size=0.3, random_state=42)
+
+# Train a Random Forest classifier
+rf = RandomForestClassifier(n_estimators=100, random_state=42)
+rf.fit(X_train, y_train)
+
+# ... (previous parts of the code)
+
+# Calculate feature importances and sort them
+feature_importances = rf.feature_importances_
+feature_names = [os.path.basename(file).replace(".tif", "") for file in environmental_layers]
+sorted_idx = np.argsort(feature_importances)
+
+# Load the correlation table
+correlation_table = pd.read_csv('D:/Primula.L/clim/xinanclim_corralation/corralation1.csv', index_col=0)
+
+# Filter correlations greater than 0.8
+high_corr_pairs = correlation_table[correlation_table > 0.8].stack().reset_index()
+high_corr_pairs.columns = ['Layer1', 'Layer2', 'Correlation']
+
+# Remove the diagonal and duplicate pairs
+high_corr_pairs = high_corr_pairs.loc[high_corr_pairs['Layer1'] != high_corr_pairs['Layer2']]
+high_corr_pairs = high_corr_pairs.drop_duplicates()
+
+# Remove less important layers from pairs with high correlation
+selected_layers = []
+for _, row in high_corr_pairs.iterrows():
+    idx1 = feature_names.index(row['Layer1'])
+    idx2 = feature_names.index(row['Layer2'])
+    if feature_importances[idx1] > feature_importances[idx2]:
+        selected_layers.append(environmental_layers[idx1])
+    else:
+        selected_layers.append(environmental_layers[idx2])
+
+
+# Remove less important layers from pairs with high correlation
+selected_layers = []
+for _, row in high_corr_pairs.iterrows():
+    idx1 = feature_names.index(row['Layer1'])
+    idx2 = feature_names.index(row['Layer2'])
+    if feature_importances[idx1] > feature_importances[idx2]:
+        selected_layers.append(environmental_layers[idx1])
+    else:
+        selected_layers.append(environmental_layers[idx2])
+
+# Ensure that all indices used to select layers are within the bounds of environmental_layers
+valid_selected_layers = [layer for layer in selected_layers if environmental_layers.index(layer) < len(environmental_layers)]
+
+# Update environmental_layers to include only the selected layers
+environmental_layers = list(set(environmental_layers) & set(valid_selected_layers))
+
+print(sorted_idx)
+
+# Now proceed with the rest of your code using the updated environmental_layers
+# ...
+
+'''
+#之后
+
+# Calculate feature importances and sort them
+feature_importances = rf.feature_importances_
+feature_names = [os.path.basename(file).replace(".tif", "") for file in environmental_layers]
+sorted_idx = np.argsort(feature_importances)
+
+# Select top 10 features
+top_10_features = sorted_idx[-10:]
+
+
+# Select top N features, where N is the minimum of 10 and the total number of features
+num_top_features = min(10, len(sorted_idx))
+top_10_features = sorted_idx[-num_top_features:]
+'''
+# Re-train the model using only the top 10 features
+X_train_top = X_train[:, sorted_idx]
+X_test_top = X_test[:, sorted_idx]
+rf.fit(X_train_top, y_train)
+
+# Predict probabilities on the test set
+y_pred_prob = rf.predict_proba(X_test_top)[:, 1]
+y_pred = rf.predict(X_test_top)
+
+# Calculate metrics
+accuracy = accuracy_score(y_test, y_pred)
+auc = roc_auc_score(y_test, y_pred_prob)
+precision = precision_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred)
+f1 = f1_score(y_test, y_pred)
+
+# Print metrics
+print(f"AUC: {auc:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1 Score: {f1:.4f}")
+print(f"Accuracy: {accuracy:.4f}")
+
+# Plot ROC curve
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_prob)
+plt.figure()
+plt.plot(fpr, tpr, label=f'ROC curve (AUC = {auc:.2f})')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.legend(loc="lower right")
+plt.show()
+
+# Extract data for top 10 features
+selected_layers = [environmental_layers[i] for i in sorted_idx]
+
+
+# Generate coordinate points for the entire range
+with rasterio.open(selected_layers[0]) as src:
+    meta = src.meta
+    width = src.width
+    height = src.height
+x_coords = np.linspace(meta['transform'][2], meta['transform'][2] + meta['transform'][0] * width, width)
+y_coords = np.linspace(meta['transform'][5], meta['transform'][5] + meta['transform'][4] * height, height)
+coords = [(x, y) for y in y_coords for x in x_coords]
+
+'''
+
+# Extract values for the top 10 features using parallel processing
+selected_data = extract_all_values(gpd.GeoDataFrame({'geometry': [Point(x, y) for x, y in coords]}), selected_layers)
+
+# Predict probabilities for each coordinate point
+prediction_probs = rf.predict_proba(selected_data)[:, 1].reshape((height, width))
+
+# Save the prediction probabilities to a new .tif file
+output_file = r"D:/Primula.L/rf/prediction.tif"
+with rasterio.open(output_file, 'w', **meta) as dst:
+    dst.write(prediction_probs, 1)
+'''
+
+
+# Extract data for the selected features using parallel processing
+selected_data = extract_all_values(gpd.GeoDataFrame({'geometry': [Point(x, y) for x, y in coords]}), environmental_layers)
+
+# Predict probabilities for each coordinate point
+prediction_probs = rf.predict_proba(selected_data)[:, 1].reshape((height, width))
+
+# Save the prediction probabilities to a new .tif file
+output_file = r"D:/Primula.L/rf/sort_clim/prediction.tif"
+with rasterio.open(output_file, 'w', **meta) as dst:
+    dst.write(prediction_probs, 1)
